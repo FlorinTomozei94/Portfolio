@@ -405,6 +405,66 @@ $content_workspace = ContentWorkspace::load($node->getRevisionId());</code></pre
 <h2>Extending It</h2>
 <p>For teams that need actual tree-shaped revision history — parent and merge-parent relationships, not just a flat live/stage split — the contrib <strong>Revision Tree</strong> module builds on top of core Workspaces rather than replacing it, adding a "Rebuild associations" operation for when things drift.</p>',
             ],
+            [
+                'title' => 'Building a Drupal Health Monitor: Signed Agents, Deterministic Findings, and an MCP Server',
+                'slug' => 'building-drupal-health-monitor',
+                'excerpt' => 'How I built a fleet dashboard for Drupal maintenance retainers: an HMAC-signed agent, deterministic analysis with AI used only for prose, an MCP server for Claude, and what a security audit and a composer audit step turned up.',
+                'tags' => ['Drupal', 'Security', 'MCP', 'Case Study'],
+                'featured' => false,
+                'published_at' => now(),
+                'content' => '<h2>The Problem: Maintenance Retainers Run on Spreadsheets</h2>
+<p>If you maintain Drupal sites for clients, you know the routine. A security advisory lands, and you open a dozen admin screens to find out which sites run the affected module, which are already patched, and which are still on a core release that drupal.org no longer supports. Then someone asks whether a site is ready for Drupal 12, and you start over.</p>
+<p>I built <strong>Drupal Health Monitor</strong> to replace that routine. It is a dashboard for a whole fleet of client sites. It shows core, module and PHP versions, flags security updates and Drupal 12 blockers, tracks uptime, and writes the plain-English report you would otherwise write by hand on Friday afternoon. The code is open source on <a href="https://github.com/FlorinTomozei94/DrupalHealthMonitor">GitHub</a>, and a live instance runs at <a href="https://health-monitor.tofdev.com">health-monitor.tofdev.com</a>. The dashboard itself sits behind a login because it holds operational client data.</p>
+<h2>Two Codebases, One Repository</h2>
+<p>The project is split in two on purpose:</p>
+<ul>
+<li><strong><code>hm_core</code></strong> is the monitor: a Drupal 11 site with custom entities for clients, sites, snapshots, findings, uptime checks and AI reports, plus the dashboard, built with Single Directory Components and HTMX.</li>
+<li><strong><code>hm_agent</code></strong> is a small module installed on each client site. It depends on core only and supports <code>^10.3 || ^11</code>, so adding it to an older client never drags in a dependency tree.</li>
+</ul>
+<p>The agent exposes one JSON endpoint with the site\'s core version, PHP version and installed modules. The monitor polls it from cron through a queue, so a slow or dead site never blocks the others.</p>
+<h2>Signed, Not Just Authenticated</h2>
+<p>An endpoint that lists every installed module is exactly what an attacker wants to scan for, so the agent does not answer anonymous requests. Each request carries an HMAC signature computed with a per-site secret, and the agent only accepts signatures inside a five-minute window. The secrets live in the Key module and in environment variables, never in config or git.</p>
+<p>The monitor has to be careful in the other direction too. It sends signed headers to a URL that someone typed into a form, so the collector must not become a way to leak those headers or to probe internal networks. That became the focus of the security pass I describe below.</p>
+<h2>Deterministic Findings, AI Only for Prose</h2>
+<p>This was the design rule I held to most strictly: <strong>detection is plain PHP with unit tests, and the model never decides what is wrong.</strong></p>
+<p>The monitor fetches release data from drupal.org and compares it with each site\'s latest snapshot. It produces findings for security updates, unsupported versions, ordinary updates and Drupal 12 blockers, optionally including results from <a href="https://www.drupal.org/project/upgrade_status">Upgrade Status</a>. Findings are reconciled against the previous run, so an unchanged finding is not rewritten and does not invalidate caches. A health score from 0 to 100 summarises each site.</p>
+<p>Only after that does the AI layer run. It receives the verified evidence and writes the client-facing summary. The effort estimate is computed in PHP from the findings, and the model only words it. If the model is wrong or unavailable, the dashboard is still correct. Reports are stored as versioned entities, so each one can be traced back to the evidence it was built from.</p>
+<h2>An MCP Server for Asking Your Fleet Questions</h2>
+<p>The part I enjoyed most is the MCP server. With it, Claude Desktop, Claude Code or any MCP client can query the fleet. I deliberately kept the surface small, with four tools:</p>
+<ul>
+<li><code>list_sites</code> returns health scores and open-finding counts.</li>
+<li><code>get_site_findings</code> returns the evidence for one site.</li>
+<li><code>get_security_updates</code> returns fleet-wide security work with the deterministic effort estimate.</li>
+<li><code>generate_site_report</code> creates a versioned AI report for one site.</li>
+</ul>
+<p>OAuth with the client-credentials grant protects the endpoint, and it uses a dedicated Drupal role with a single scope. The broad tools that ship with the contributed MCP module are disabled, so a leaked token can read fleet status and trigger a report. That is all it can do.</p>
+<h2>The Audit: What Changed When I Read My Own Code Critically</h2>
+<p>After the feature work was done, I ran a full audit of the project, the kind you would do before handing the code to a client. The findings were not exotic. They were the ordinary gaps that appear when you build fast:</p>
+<ul>
+<li><strong>Redirects could leak signed headers.</strong> The collector followed HTTP redirects, so a site that redirected elsewhere would receive the signed request. Redirects are now off.</li>
+<li><strong>Unbounded response bodies.</strong> A hostile or broken site could stream gigabytes back at the worker. Responses from agents are now capped at 2 MB, and the drupal.org release feed at 5 MB, using a streaming reader that stops early.</li>
+<li><strong>Unvalidated URLs.</strong> Site base URLs are limited to <code>http</code> and <code>https</code> in the entity constraint, and the runner checks again before it sends a request.</li>
+<li><strong>Queue pile-ups.</strong> If the worker fell behind, cron kept enqueueing the same site. A per-site pending marker now stops the duplicates.</li>
+<li><strong>Orphaned data.</strong> Deleting a site left its snapshots, findings, reports and uptime rows behind, which inflated fleet totals. Deleting a site now cascades, and a client that still owns sites cannot be deleted.</li>
+<li><strong>Unbounded growth.</strong> Every check writes a snapshot and an uptime row, so a fleet grows by hundreds of rows per site per day. Retention now runs on cron: uptime rows are kept for 90 days and snapshots for 30, and each site always keeps its newest snapshot.</li>
+<li><strong>Alphabetical severity.</strong> Findings were sorted by name, which put "critical" after "high". Sorting now uses real urgency.</li>
+</ul>
+<p>Each fix came with a test. The rule I follow is that a bug I only fix will come back, and a bug I fix with a failing test first will not.</p>
+<h2>The CI Step That Paid for Itself</h2>
+<p>Part of the audit was adding <code>composer audit --locked</code> to the GitHub Actions pipeline, next to PHPUnit, PHPStan and PHPCS. I expected it to be hygiene. Instead, it failed on the pull request that introduced it.</p>
+<p>New advisories had been published for Twig and for Drupal core itself, including a remote code execution issue fixed in core 11.4.13. Production was a couple of patch releases behind. The pipeline caught it before I did, I updated the lockfile on the same branch, and the green build deployed the fix.</p>
+<p>Advisories change over time, so a dependency audit that only runs when you remember it is not much of an audit. Running it on every push means a red build on an untouched branch tells you something has changed upstream.</p>
+<h2>Deployment</h2>
+<p>The monitor ships as a Docker image to Railway, with an app service, a separate cron service built from the same image, and managed MySQL. A pre-deploy script runs <code>drush deploy</code>, so config import and updates apply on every release. Locally, DDEV spins up the monitor and two independent demo client sites, so the whole fleet flow can be tried on one laptop. A Drupal recipe installs the monitor with demo content in one command.</p>
+<h2>What I Would Do Next</h2>
+<ul>
+<li>Notifications when a new security finding appears, so the dashboard is not the only place to learn about it.</li>
+<li>An uptime trend per site, since the history is already being collected.</li>
+<li>Fixing the GitHub-to-Railway trigger. It did not fire on my last merge, so I deployed that release by hand.</li>
+</ul>
+<h2>Try It</h2>
+<p>The source, the architecture diagram and the setup steps are in the <a href="https://github.com/FlorinTomozei94/DrupalHealthMonitor">repository</a>, and the <a href="https://health-monitor.tofdev.com">live instance</a> shows the deployed result. If you maintain Drupal sites for a living, I would like to hear which check you would want on that dashboard first.</p>',
+            ],
         ];
 
         foreach ($posts as $data) {
